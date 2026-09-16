@@ -1,116 +1,60 @@
-# Файл bot.py
 import os
 import asyncio
-import logging
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile
 import yt_dlp
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Вставьте ваш токен или передайте его через переменную окружения на Hugging Face
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+load_dotenv()
 
-# Настройка логов
-logging.basicConfig(level=logging.INFO)
+BOT_TOKEN = os.environ['BOT_TOKEN']
+MAX_FILE_SIZE_MB = 50
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-
-# Семафор: максимум 2 одновременных скачивания
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(2)
-
-# Лимит на размер файла Telegram (50 МБ в байтах)
-MAX_FILE_SIZE = 50 * 1024 * 1024
-
-@dp.message(CommandStart())
-async def start_cmd(message: types.Message):
-    await message.answer(
-        "Привет! Отправь мне ссылку на видео с YouTube, TikTok или Instagram Reels, и я скачаю его для тебя."
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Отправь мне ссылку на видео (YouTube, TikTok, Instagram, Facebook), и я скачаю его.\n\n"
+        "⚠️ Ограничение: файлы до 50 МБ."
     )
 
-def download_video_sync(url: str, output_path: str) -> dict:
-    """Синхронная функция скачивания через yt-dlp."""
+async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text
+    if not url.startswith("http"):
+        await update.message.reply_text("Пожалуйста, отправь ссылку на видео.")
+        return
+
+    msg = await update.message.reply_text("⏳ Скачиваю видео, подожди немного...")
+
     ydl_opts = {
-        'format': 'b[filesize<=50M]/mp4/best[filesize<=50M]/best',
-        'outtmpl': output_path,
+        'outtmpl': 'downloads/%(id)s.%(ext)s',
+        'format': f'best[filesize<{MAX_FILE_SIZE_MB}M]/best[height<=720]',
         'quiet': True,
         'no_warnings': True,
-        'max_filesize': MAX_FILE_SIZE,
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=True)
 
-@dp.message(F.text.startswith("http://") | F.text.startswith("https://"))
-async def handle_video_link(message: types.Message):
-    url = message.text.strip()
-    status_msg = await message.answer("⏳ Видео добавлено в очередь...")
+    try:
+        def download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(info), info.get('title', 'Видео')
 
-    async with DOWNLOAD_SEMAPHORE:
-        await status_msg.edit_text("📥 Скачиваю видео, подождите...")
+        filename, title = await asyncio.to_thread(download)
+
+        await msg.edit_text("📤 Отправляю файл...")
         
-        file_id = f"video_{message.from_user.id}_{message.message_id}.mp4"
-        output_template = f"/tmp/{file_id}"
+        with open(filename, 'rb') as video:
+            await update.message.reply_video(video, caption=title[:1024])
 
-        try:
-            # Запуск скачивания в отдельном потоке, чтобы не блокировать бота
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, download_video_sync, url, output_template)
+        os.remove(filename)
 
-            # Проверка существования и размера файла
-            if not os.path.exists(output_template):
-                await status_msg.edit_text("❌ Не удалось скачать видео или формат не поддерживается.")
-                return
+    except Exception as e:
+        await msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
 
-            file_size = os.path.getsize(output_template)
-
-            if file_size > MAX_FILE_SIZE:
-                await status_msg.edit_text(
-                    "⚠️ **Ошибка:** Размер скачанного видео превышает 50 МБ. "
-                    "Telegram API не позволяет отправлять файлы такого размера через ботов."
-                )
-            else:
-                await status_msg.edit_text("📤 Отправляю видео...")
-                video_file = FSInputFile(output_template)
-                await message.answer_video(video=video_file)
-                await status_msg.delete()
-
-        except yt_dlp.utils.FileTooLargeError:
-            await status_msg.edit_text("⚠️ **Ошибка:** Файл превышает лимит 50 МБ и не был скачан.")
-        except Exception as e:
-            logging.error(f"Ошибка при обработке ссылки: {e}")
-            await status_msg.edit_text("❌ Произошла ошибка при скачивании видео. Проверьте ссылку.")
+if __name__ == '__main__':
+    if not os.path.exists('downloads'):
+        os.makedirs('downloads')
         
-        finally:
-            # Очистка диска: удаляем файл в любом случае
-            if os.path.exists(output_template):
-                os.remove(output_template)
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    
-# файл requirements.txt
-aiogram==3.15.0
-yt-dlp
-
-# Файл Dockerfile
-FROM python:3.11-slim
-
-# Установка ffmpeg (необходим для сборки и конвертации видео в yt-dlp)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-# Копируем зависимости и устанавливаем их
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Копируем остальной код
-COPY . .
-
-# Запуск бота
-CMD ["python", "bot.py"]
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
+    print('Бот запущен и работает...')
+    app.run_polling()
